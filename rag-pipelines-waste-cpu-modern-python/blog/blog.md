@@ -2,7 +2,7 @@
 title: "Why Most RAG Pipelines Waste CPU — and How Modern Python Fixes It"
 date: "2026-02-10"
 author: "NavyaAI Engineering Team"
-excerpt: "Embedding-based RAG pipelines are everywhere—but most waste CPU, over-scale infrastructure, and hide inefficiencies behind containers. Modern Python finally gives us a better execution model with multi-interpreter execution and higher per-core utilization."
+excerpt: "We benchmarked RAG ingestion across Python 3.13, 3.14, and 3.14t (free-threaded). The results surprised us: threads already win for embedding workloads, InterpreterPoolExecutor can't load NumPy yet, and the no-GIL build adds overhead. Here's what actually matters for your infra bill."
 coverImage: "/blog/rag-pipelines-waste-cpu-modern-python/hero.png"
 tags:
   - "Python"
@@ -114,26 +114,18 @@ Each document can be processed independently:
 - Generate embeddings  
 - Append to the index  
 
-We compare three ingestion architectures:
+We tested two execution models across **three Python builds**:
 
 - **Threads** – `ThreadPoolExecutor`  
 - **Multiprocessing** – `ProcessPoolExecutor`  
-- **Modern interpreters** – `InterpreterPoolExecutor` (Python 3.14+)  
 
-### Traditional Architecture
+On:
 
-- One process → one worker  
-- High CPU overhead from GIL contention (~350%)  
-- Throughput increases only by adding pods  
+- **Python 3.13** – standard GIL  
+- **Python 3.14** – standard GIL + `InterpreterPoolExecutor` available  
+- **Python 3.14t** – free-threaded build (no GIL)  
 
-### Improved Architecture
-
-- One process  
-- Multiple isolated interpreters  
-- Each interpreter handles a subset of documents  
-- All CPU cores utilized  
-
-Same machine. Same memory footprint. More work done.
+We also attempted `InterpreterPoolExecutor` on Python 3.14 — with an important result we'll discuss below.
 
 ---
 
@@ -142,69 +134,77 @@ Same machine. Same memory footprint. More work done.
 The benchmark is implemented as a small Python package:
 
 - Synthetic document generator  
-- Real embedding model wrapper  
-- Thread-, process-, and interpreter-based ingestion pipelines  
-- Metrics module for timing and resource sampling  
+- Real embedding model wrapper (`sentence-transformers/all-MiniLM-L6-v2`)  
+- Thread-based and process-based ingestion pipelines  
+- Metrics module for timing and resource sampling (including child processes)  
 - CLI runner that writes structured results to a CSV file  
 
 We track:
 
 - Wall-clock ingestion time  
 - Documents per second  
-- Mean and max CPU utilization  
-- Approximate peak memory (RSS)  
+- Mean and max CPU utilization (process tree: parent + all children)  
+- Approximate peak memory (RSS, process tree)  
 
-From there, a plotting script aggregates the CSV and generates two key plots:
-
-- **Throughput by scenario** (`documents_per_second_by_scenario.png`)  
-- **CPU utilization by scenario** (`cpu_mean_by_scenario.png`)  
-
-These plots are what we embed below.
-
-**Methodology note:** All benchmarks were run on a dedicated GCP `e2-standard-4` instance (4 vCPUs, 16 GB RAM) with no competing workloads, to minimize noise. Each scenario was run at 1k, 5k, and 10k document scales. CPU utilization is measured via `psutil` for the process tree (parent + child workers). On Python 3.13, the "modern interpreters" path falls back to `ProcessPoolExecutor` because `InterpreterPoolExecutor` requires Python 3.14+.
+**Methodology note:** All benchmarks were run on a dedicated GCP `e2-standard-4` instance (4 vCPUs, 16 GB RAM) running Ubuntu 24.04, with no competing workloads. Each scenario was run at 1,000, 5,000, and 10,000 document scales. We tested three Python builds: Python 3.13.1, Python 3.14.3 (standard), and Python 3.14.3 free-threaded (`python3.14t`, GIL disabled). CPU utilization is measured via `psutil` across the full process tree.
 
 ---
 
-## Results: What Modern Python Buys You
+## Results: What We Actually Found
 
-On a dedicated 4-vCPU GCP instance (e2-standard-4) with 1,000 to 10,000 synthetic documents, we observed a surprising pattern:
+We ran the same benchmark across Python 3.13, 3.14, and 3.14t (free-threaded) on a dedicated 4-vCPU GCP instance. The results were not what we expected.
 
-- Threads are fastest — because embedding models release the GIL during C-level computation.  
-- Multiprocessing and interpreter-based pools pay a heavy tax in IPC overhead and per-worker model loading.  
-- But threads burn ~350% CPU (GIL contention overhead) and the process pools use 3.5× more memory.  
+### Throughput: Python 3.13 vs 3.14 vs 3.14t
 
-### Throughput by Scenario
+![RAG ingestion throughput comparison](/blog/rag-pipelines-waste-cpu-modern-python/throughput_314_comparison.png)
 
-![RAG ingestion throughput by scenario](/blog/rag-pipelines-waste-cpu-modern-python/documents_per_second_by_scenario.png)
+| Build | Threads (docs/s) | Multiprocessing (docs/s) |
+|-------|------------------|--------------------------|
+| Python 3.13 | **21.8** | 16.2 |
+| Python 3.14 | **22.0** | 13.1 |
+| Python 3.14t (no-GIL) | **20.5** | 13.5 |
 
-This chart shows mean documents/second for each approach across runs.
+The key finding: **threads are consistently fastest across all Python versions** — and the free-threaded build (3.14t) is actually *slightly slower* than the standard GIL build.
 
-At a glance:
+Why? The embedding model (`sentence-transformers/all-MiniLM-L6-v2`) releases the GIL during C-level BLAS operations. Threads already parallelize the heavy computation. Removing the GIL doesn't help — it adds overhead from the free-threading synchronization mechanisms.
 
-- **Threads**: highest throughput (~21.8 docs/s mean) — the embedding model releases the GIL during matrix ops.  
-- **Multiprocessing**: ~16.2 docs/s mean — IPC serialization and per-worker model loading create overhead.  
-- **Modern interpreters**: ~14.6 docs/s mean on Python 3.13 (falls back to `ProcessPoolExecutor`; true `InterpreterPoolExecutor` requires 3.14+).  
+### CPU Utilization
 
-The thread advantage is consistent across scales (1k, 5k, 10k documents). Embedding models that release the GIL genuinely benefit from thread-level parallelism.
+![CPU utilization comparison](/blog/rag-pipelines-waste-cpu-modern-python/cpu_314_comparison.png)
 
-### CPU Utilization by Scenario
+All three thread builds burn ~340–354% CPU on a 4-vCPU machine. Multiprocessing stays under 6% (measured from the parent process tree).
 
-![CPU utilization by scenario](/blog/rag-pipelines-waste-cpu-modern-python/cpu_mean_by_scenario.png)
+### Memory
 
-This plot reveals an important insight — threads **waste** CPU rather than under-utilize it:
+![Memory usage comparison](/blog/rag-pipelines-waste-cpu-modern-python/memory_314_comparison.png)
 
-| Metric              | Threads | Multiprocessing | Modern interpreters |
-|---------------------|---------|-----------------|---------------------|
-| Mean CPU usage      | ~350%   | ~3%             | ~3%                 |
-| Mean throughput      | 21.8 docs/s | 16.2 docs/s | 14.6 docs/s     |
-| Peak memory (MB)    | ~941    | ~3,515          | ~3,508              |
+| Build | Threads (MB) | Multiprocessing (MB) |
+|-------|-------------|---------------------|
+| Python 3.13 | 941 | 3,515 |
+| Python 3.14 | 962 | 4,233 |
+| Python 3.14t (no-GIL) | 1,060 | 4,551 |
 
-The important bit isn’t the exact numbers—they’ll vary by machine, dataset, and model.  
-It’s the **shape** of the curves:
+The free-threaded build uses ~12% more memory for threads and ~30% more for multiprocessing compared to 3.13. Each new Python version adds some overhead — the 3.14 runtime is larger, and the no-GIL build needs additional per-object synchronization state.
 
-- Threads are fastest but burn ~350% CPU — the embedding model (sentence-transformers) releases the GIL during C-level BLAS/ONNX operations, so threads genuinely parallelize the heavy work.  
-- Multiprocessing and interpreter pools pay a heavy tax: each worker loads its own ~900 MB model copy, and IPC serialization of documents and numpy arrays adds latency.  
-- On Python 3.13, `InterpreterPoolExecutor` falls back to `ProcessPoolExecutor` — the true per-interpreter-GIL advantage requires Python 3.14+.  
+### What About InterpreterPoolExecutor?
+
+Python 3.14 ships `InterpreterPoolExecutor` in `concurrent.futures` — each worker runs in its own sub-interpreter with its own GIL. In theory, this is the best of both worlds: process-level isolation with thread-level overhead.
+
+In practice, **it doesn’t work yet for embedding workloads**. When we tried it:
+
+```
+module numpy._core._multiarray_umath does not support loading in subinterpreters
+```
+
+NumPy, PyTorch, and most C extensions haven’t been updated to support sub-interpreters. The arguments and return values must also be “shareable” types (no dicts, no numpy arrays). This is a fundamental ecosystem limitation that will take time to resolve.
+
+`InterpreterPoolExecutor` is real and working for **pure-Python** workloads. But for anything involving C extensions — which is virtually all ML/embedding work — it’s not usable today.
+
+### Efficiency Map
+
+![Efficiency comparison](/blog/rag-pipelines-waste-cpu-modern-python/efficiency_314_comparison.png)
+
+This scatter plot shows the full picture: throughput vs CPU usage, with bubble size proportional to memory. Threads cluster in the top-right — fast but CPU-hungry. Multiprocessing sits in the bottom-left — slow, low apparent CPU, but with massive memory bubbles.
 
 ---
 
@@ -212,16 +212,16 @@ It’s the **shape** of the curves:
 
 This isn’t a micro-optimization. It directly affects production economics.
 
-Consider what our benchmarks show on a dedicated 4-vCPU instance:
+Here’s what our benchmarks show on a dedicated 4-vCPU instance:
 
-| Metric                       | Process Pools (current) | Threads (optimized) |
-|------------------------------|------------------------|---------------------|
-| Throughput (docs/s)      | ~15    | ~22    |
-| Memory per instance  | ~3.5 GB | ~1 GB  |
-| Pods for 100 docs/s | 7      | 5      |
-| Monthly infra cost  | 1.0×   | ~0.7×  |
+| Metric                       | Multiprocessing | Threads |
+|------------------------------|----------------|---------|
+| Throughput (docs/s)          | ~13–16         | ~21–22  |
+| Memory per instance          | ~3.5–4.6 GB   | ~1 GB   |
+| Pods for 100 docs/s          | 7–8            | 5       |
+| Monthly infra cost           | 1.0×           | ~0.6×   |
 
-By choosing the right execution model and reducing per-instance memory, you need fewer and smaller instances.
+By choosing threads (which already parallelize well for GIL-releasing C extensions), you get **46% more throughput** with **75% less memory per instance**.
 
 > **Better execution → fewer machines → lower cost.**
 
@@ -266,21 +266,33 @@ One bad document—or one bad retrieval path—shouldn’t take down the entire 
 
 ---
 
-## When This Approach Makes Sense
+## What Actually Works Today
 
-The multi-interpreter model works best when:
+Based on our benchmarks across three Python builds, here’s the practical guidance:
 
-- Workloads are CPU-bound  
-- Tasks are independent or loosely coupled  
-- Long-lived workers are preferable to short-lived jobs  
+**Use threads (`ThreadPoolExecutor`) when:**
 
-It is *not* a replacement for:
+- Your embedding model or C extension releases the GIL during computation (most do)  
+- Tasks are independent per document or chunk  
+- You want maximum throughput with minimal memory  
 
-- GPU-bound inference  
-- Highly stateful shared-memory systems  
-- I/O-dominated pipelines  
+**Use multiprocessing (`ProcessPoolExecutor`) when:**
 
-Like any tool, it’s about using the right abstraction at the right layer.
+- You need true process isolation (fault tolerance, security boundaries)  
+- Your workload involves pure-Python code that holds the GIL  
+- Memory overhead is acceptable  
+
+**Wait on `InterpreterPoolExecutor` until:**
+
+- NumPy, PyTorch, and other C extensions add sub-interpreter support  
+- The shareable types constraint is relaxed (or you’re doing pure-Python work)  
+- Python 3.15+ matures the ecosystem  
+
+**The free-threaded build (3.14t) is interesting but premature for production:**
+
+- Slight throughput regression for workloads where C extensions already release the GIL  
+- Higher memory overhead (~12% for threads, ~30% for multiprocessing)  
+- Real wins will come for pure-Python CPU-bound code that previously couldn’t parallelize  
 
 ---
 
@@ -292,11 +304,12 @@ The original idea for this post was simple:
 
 To move beyond hand-wavy claims, we:
 
-1. Implemented three ingestion architectures (threads, processes, interpreters).  
+1. Implemented thread-based and process-based ingestion pipelines.  
 2. Used a real CPU-bound embedding model instead of a synthetic workload.  
 3. Measured wall-clock time, docs/sec, and CPU usage with `psutil`.  
 4. Captured results into CSV and plotted them with `matplotlib`.  
-5. Wrapped everything in a single Docker image you can run yourself.  
+5. Tested across Python 3.13, 3.14, and 3.14t (free-threaded) on a clean GCP instance.  
+6. Wrapped everything in a single Docker image you can run yourself.  
 
 The full benchmark code, raw results CSV, and plotting scripts are open source:
 
@@ -328,9 +341,10 @@ And just as importantly, it lets us move performance conversations **closer to t
 
 We’re actively exploring:
 
-- Parallel RAG ingestion architectures  
-- Interpreter-isolated agent execution  
-- Runtime safety controls for AI workflows  
+- Thread-optimised RAG ingestion with GIL-releasing embedding models  
+- Monitoring `InterpreterPoolExecutor` ecosystem readiness (NumPy, PyTorch sub-interpreter support)  
+- Runtime safety controls for agentic AI workflows  
+- The free-threaded build’s impact on pure-Python CPU-bound workloads  
 
 If you’re building RAG systems and feeling the cost pain already—this problem is yours too.
 

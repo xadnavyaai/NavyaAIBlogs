@@ -81,6 +81,12 @@ def _parse_args() -> argparse.Namespace:
         default="results/results.csv",
         help="Path to write CSV results.",
     )
+    parser.add_argument(
+        "--tag",
+        type=str,
+        default="",
+        help="Optional prefix tag for scenario names in the CSV (e.g. 'py314-').",
+    )
     return parser.parse_args()
 
 
@@ -158,8 +164,13 @@ def main() -> None:
     scenarios = _select_scenarios(args)
     results: List[metrics.BenchmarkResult] = []
 
+    tag = args.tag
     for scenario in scenarios:
         result = _run_single_scenario(scenario, documents, cfg)
+        if tag:
+            result = result._replace(scenario=f"{tag}{result.scenario}") if hasattr(result, '_replace') else result
+            # BenchmarkResult is a plain object; patch scenario name if tagged.
+            result.scenario = f"{tag}{scenario}"
         results.append(result)
 
     _write_results(args.results_path, results)
