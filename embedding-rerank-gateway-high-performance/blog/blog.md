@@ -165,6 +165,8 @@ Same benchmark (2000 requests, concurrency 16). **All numbers from the same GCP 
 
 Same model (all-MiniLM-L6-v2), same VM, same benchmark (c=16, 2000 req). **Baseline: Python.**
 
+**Summary (Rust vs Python, same model):** **+28%** throughput (RPS), **−67%** memory per replica. At production load (e.g. 5K–20K RPS), that’s **~25–30% fewer nodes** and **~\$5K–\$22K/year** savings depending on scale (4‑vCPU nodes, GCP-style pricing).
+
 | | Python (A) | Rust (B) | Split (C) |
 |---|------------|----------|-----------|
 | **RPS** | 356 | **456** (+28%) | **450** (+27%) |
@@ -177,17 +179,32 @@ Same model (all-MiniLM-L6-v2), same VM, same benchmark (c=16, 2000 req). **Basel
 - **Latency:** ~18–22% lower p95 → better UX and easier SLOs.
 - **Memory:** Rust monolith uses **67% less RAM** than Python; Split uses **41% less**. On a 4‑vCPU node you can run more replicas or leave room for other workloads.
 
-**Projected savings (illustrative)**
+**Business impact: production-grade estimate (Rust vs Python, same model)**
 
-Assume you need **500 RPS** at p95 &lt; 150 ms, and each replica is sized as in our benchmark:
+| Metric | Rust vs Python |
+|--------|-----------------|
+| **Throughput** | **+28%** RPS per replica |
+| **Memory** | **−67%** per replica (387 MiB → 126 MiB) |
 
-| | Python | Rust (B) | Split (C) |
-|---|--------|----------|-----------|
-| **Replicas needed** (500 ÷ RPS) | 2 | 2 | 2 |
-| **Total RSS** | ~774 MiB | ~252 MiB | ~456 MiB |
-| **vs Python** | — | **−67% memory** | **−41% memory** |
+Replicas needed at sustained load (from our 4‑vCPU benchmark, same API and model):
 
-At **1,000 RPS**: Python → 3 replicas (~1.16 GiB); Rust → 3 replicas (~378 MiB) → **~68% less memory**. Same semantics and API; smaller footprint and better tail latency.
+| Target load | Python (356 RPS/replica) | Rust (456 RPS/replica) | Fewer replicas |
+|-------------|---------------------------|--------------------------|----------------|
+| **5,000 RPS** | 15 | 11 | **4** |
+| **10,000 RPS** | 29 | 22 | **7** |
+| **20,000 RPS** | 57 | 44 | **13** |
+
+Using a typical 4‑vCPU node cost of **~\$1,200–\$1,700/year** (GCP e.g. n2-standard-4, on-demand or 1‑yr commit), switching the gateway from Python to Rust (same semantics) gives:
+
+- **5K RPS:** **~\$4.8K–\$6.8K** annual savings (4 fewer nodes).
+- **10K RPS:** **~\$8.4K–\$12K** annual savings (7 fewer nodes).
+- **20K RPS:** **~\$16K–\$22K** annual savings (13 fewer nodes).
+
+That’s **~27% fewer nodes** at a given load, so **~25–30% lower infrastructure cost** for the gateway layer at production scale. Add **~67% less memory** per replica for better packing or smaller instance types where applicable.
+
+**Projected savings (illustrative, low load)**
+
+At **500 RPS** or **1,000 RPS** you may need the same replica count (2–3) for both stacks; the gain is **~68% less memory** (e.g. 1.16 GiB → 378 MiB at 1K RPS), so you can downsize instances or pack more services per node.
 
 **When to pick which**
 
