@@ -1,0 +1,3 @@
+# Minimal deps for running gateway_bench.bench (client only). Gateway runs in Docker.
+httpx>=0.27.0
+psutil>=5.9.0

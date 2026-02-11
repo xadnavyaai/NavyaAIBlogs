@@ -1,0 +1,4 @@
+# Populate this directory by running from repo root:
+#   pip install 'optimum[onnx]' transformers
+#   python scripts/export_onnx.py -o rust-gateway/model
+# Then you should have model.onnx and tokenizer.json here.

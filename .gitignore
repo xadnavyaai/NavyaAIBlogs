@@ -204,4 +204,7 @@ cython_debug/
 # Marimo
 marimo/_static/
 marimo/_lsp/
-__marimo__/
+__marimo__
+
+# Embedding gateway: ONNX model (run scripts/export_onnx.py to generate)
+embedding-rerank-gateway-high-performance/rust-gateway/model/model.onnx

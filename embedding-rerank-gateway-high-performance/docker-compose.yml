@@ -1,0 +1,28 @@
+# Architecture C: Split (native) — embedding service + thin gateway.
+# Prereq: export ONNX model into rust-gateway/model, then build the Rust image:
+#   cd rust-gateway && docker build -t embedding-gateway-rust .
+# Then from this directory: docker-compose up -d
+# Benchmark (from host): python -m gateway_bench.bench http://localhost:8000 -c 16 -n 2000
+
+services:
+  embed:
+    build:
+      context: ./rust-gateway
+      dockerfile: Dockerfile
+    image: embedding-gateway-rust
+    environment:
+      SERVE_EMBED_ONLY: "true"
+      MODEL_DIR: /app/model
+      PORT: "8080"
+    expose:
+      - "8080"
+    # No ports to host unless you want to call /embed from host
+
+  gateway:
+    image: embedding-gateway-rust
+    environment:
+      EMBEDDING_API_URL: http://embed:8080/embed
+    ports:
+      - "8000:8000"
+    depends_on:
+      - embed
