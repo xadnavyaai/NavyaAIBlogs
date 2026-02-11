@@ -42,10 +42,30 @@ def _sample_process(
 
     # Prime the CPU measurement to get a useful first value.
     proc.cpu_percent(interval=None)
+    # Also prime child processes if any exist.
+    for child in proc.children(recursive=True):
+        try:
+            child.cpu_percent(interval=None)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
 
     while not stop_event.is_set():
-        cpu = proc.cpu_percent(interval=interval_s)
-        mem = proc.memory_info().rss / (1024 * 1024)  # MB
+        # Measure the main process.
+        try:
+            cpu = proc.cpu_percent(interval=interval_s)
+            mem = proc.memory_info().rss / (1024 * 1024)  # MB
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            cpu = 0.0
+            mem = 0.0
+
+        # Add CPU and memory from all child processes (workers).
+        for child in proc.children(recursive=True):
+            try:
+                cpu += child.cpu_percent(interval=None)
+                mem += child.memory_info().rss / (1024 * 1024)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
         cpu_samples.append(cpu)
         mem_samples.append(mem)
 
